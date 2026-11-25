@@ -204,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
     except EntryError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except OSError as exc:
+        print(f"error: cannot write entry: {exc}", file=sys.stderr)
+        return 1
     print(report(ENTRY, target))
     return 0
 
