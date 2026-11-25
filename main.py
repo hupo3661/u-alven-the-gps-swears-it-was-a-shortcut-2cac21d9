@@ -13,22 +13,30 @@ for a driver who mutes it every trip -- the scenic detour past the
 lake is the punchline, a fresh detail instead of the usual
 recalculating gag.
 
-Layout of this program
-----------------------
+How this revision is organised
+------------------------------
 * :data:`ENTRY` -- the single line being entered, kept verbatim.
-* ``check_*`` -- gate checks, one small check per helper, so a
-  failing rule names itself in the error message.
-* :data:`CHECKS` -- the checks in the order they run.
-* :func:`resolve_output_path` -- where the file goes, honouring the
-  ``MAKEFUN_OUTPUT_DIR`` override used by the harness.
-* :func:`write_entry` / :func:`verify_written` -- write the file,
-  then read it back and prove it matches, byte for byte.
-* :func:`summarize` -- the one-line report printed on success.
+* :class:`Limits` -- every numeric gate in one frozen dataclass,
+  so a limit is changed in exactly one place.
+* :class:`EntryError` -- one exception type for every gate failure,
+  so ``main`` reports a bad entry the same way every time.
+* ``rule_*`` -- each gate is a small predicate-style function that
+  raises :class:`EntryError` naming the rule it enforces; ``RULES``
+  lists them in the order they run.
+* :func:`validate` -- runs ``RULES`` in order, first failure wins.
+* :class:`Sink` -- resolves the output location (honouring the
+  ``MAKEFUN_OUTPUT_DIR`` override used by the harness) and owns the
+  write-then-read-back proof that the file matches ``ENTRY``.
+* :func:`report` -- the one-line success report printed on success.
 * :func:`main` -- glue: validate, write, verify, report.
 """
 
+from __future__ import annotations
+
 import os
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 
 ENTRY = (
     "The map promised a bridge, the river disagreed, and since "
@@ -36,127 +44,167 @@ ENTRY = (
     "lake was fair payback."
 )
 
-MAX_CHARS = 200
-MIN_CHARS = 1
 
-MIN_WORDS = 2
-MAX_WORDS = 1000
+@dataclass(frozen=True)
+class Limits:
+    """The competition's numeric gates, in one place."""
 
-def check_not_empty(entry: str) -> None:
+    max_chars: int = 200
+    min_chars: int = 1
+    min_words: int = 2
+    max_words: int = 1000
+
+
+LIMITS = Limits()
+
+OUTPUT_FILENAME = "entry.txt"
+DEFAULT_OUTPUT_DIR = "/output"
+OUTPUT_ENV_VAR = "MAKEFUN_OUTPUT_DIR"
+
+
+class EntryError(ValueError):
+    """A gate rule rejected the entry; the message names the rule."""
+
+
+def _fail(rule: str, detail: str) -> None:
+    """Raise the single error type every gate uses."""
+    raise EntryError(f"{rule}: {detail}")
+
+
+def rule_not_empty(entry: str) -> None:
     """Reject blank or whitespace-only entries."""
     if not entry.strip():
-        raise ValueError("entry must not be empty or only whitespace")
+        _fail("not-empty", "entry must not be empty or only whitespace")
 
 
-def check_single_line(entry: str) -> None:
+def rule_single_line(entry: str) -> None:
     """Reject anything that is not exactly one line of text."""
     if "\n" in entry or "\r" in entry:
-        raise ValueError("entry must be a single line (no line breaks)")
+        _fail("single-line", "entry must be a single line (no line breaks)")
 
 
-def check_length(entry: str) -> None:
-    """Enforce the competition's character gate."""
-    if len(entry) < MIN_CHARS:
-        raise ValueError(f"entry is empty, need at least {MIN_CHARS} char")
-    if len(entry) > MAX_CHARS:
-        raise ValueError(
-            f"entry is {len(entry)} chars, over the {MAX_CHARS} limit"
-        )
-
-
-def check_text_safe(entry: str) -> None:
-    """Reject control characters and confirm the text is valid UTF-8."""
-    entry.encode("utf-8")  # raises UnicodeEncodeError if not valid UTF-8
-    bad = [c for c in entry if ord(c) < 0x20 and c not in ("\t",)]
-    if bad:
-        raise ValueError(
-            "entry contains control characters: "
-            + ", ".join(f"U+{ord(c):04X}" for c in bad)
-        )
-
-
-def check_no_edge_whitespace(entry: str) -> None:
+def rule_no_edge_whitespace(entry: str) -> None:
     """Reject leading/trailing spaces that would be invisible in output."""
     if entry != entry.strip():
-        raise ValueError("entry must not start or end with whitespace")
+        _fail("no-edge-whitespace", "entry must not start or end with whitespace")
 
 
-def check_word_count(entry: str) -> None:
-    """Enforce the competition's word-count gate."""
-    words = entry.split()
-    if len(words) < MIN_WORDS:
-        raise ValueError(f"entry needs at least {MIN_WORDS} word(s)")
-    if len(words) > MAX_WORDS:
-        raise ValueError(
-            f"entry has {len(words)} words, over the {MAX_WORDS} limit"
+def rule_length(entry: str, limits: Limits = LIMITS) -> None:
+    """Enforce the competition's character gate."""
+    if len(entry) < limits.min_chars:
+        _fail("length", f"entry is empty, need at least {limits.min_chars} char")
+    if len(entry) > limits.max_chars:
+        _fail(
+            "length",
+            f"entry is {len(entry)} chars, over the {limits.max_chars} limit",
         )
 
 
-def check_ends_with_period(entry: str) -> None:
+def rule_text_safe(entry: str) -> None:
+    """Reject control characters and confirm the text is valid UTF-8."""
+    entry.encode("utf-8")  # raises UnicodeEncodeError if not valid UTF-8
+    bad = [c for c in entry if ord(c) < 0x20 and c != "\t"]
+    if bad:
+        _fail(
+            "text-safe",
+            "entry contains control characters: "
+            + ", ".join(f"U+{ord(c):04X}" for c in bad),
+        )
+
+
+def rule_word_count(entry: str, limits: Limits = LIMITS) -> None:
+    """Enforce the competition's word-count gate."""
+    words = entry.split()
+    if len(words) < limits.min_words:
+        _fail("word-count", f"entry needs at least {limits.min_words} word(s)")
+    if len(words) > limits.max_words:
+        _fail(
+            "word-count",
+            f"entry has {len(words)} words, over the {limits.max_words} limit",
+        )
+
+
+def rule_ends_with_period(entry: str) -> None:
     """Sanity check: the line is one finished sentence, so it ends in a stop."""
     if not entry.endswith("."):
-        raise ValueError("entry should end with a full stop")
+        _fail("ends-with-period", "entry should end with a full stop")
 
 
-def check_no_double_spaces(entry: str) -> None:
+def rule_no_double_spaces(entry: str) -> None:
     """Sanity check: no doubled spaces hiding in the middle of the line."""
     if "  " in entry:
-        raise ValueError("entry must not contain double spaces")
+        _fail("no-double-spaces", "entry must not contain double spaces")
 
 
-CHECKS = (
-    check_not_empty,
-    check_single_line,
-    check_no_edge_whitespace,
-    check_length,
-    check_text_safe,
-    check_word_count,
-    check_ends_with_period,
-    check_no_double_spaces,
+RULES = (
+    rule_not_empty,
+    rule_single_line,
+    rule_no_edge_whitespace,
+    rule_length,
+    rule_text_safe,
+    rule_word_count,
+    rule_ends_with_period,
+    rule_no_double_spaces,
 )
 
 
-def validate_entry(entry: str) -> None:
-    """Run every gate check in CHECKS order; raise naming the first failure."""
-    for check in CHECKS:
-        check(entry)
+def validate(entry: str) -> None:
+    """Run every gate rule in RULES order; the first failure raises."""
+    for rule in RULES:
+        rule(entry)
 
 
-def resolve_output_path() -> str:
-    """Return the path of the file to write, creating its directory."""
-    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(output_dir, exist_ok=True)
-    return os.path.join(output_dir, "entry.txt")
+@dataclass(frozen=True)
+class Sink:
+    """Where the entry file goes, and the proof it landed intact."""
+
+    directory: str
+    filename: str = OUTPUT_FILENAME
+
+    @classmethod
+    def from_environment(cls) -> "Sink":
+        """Honour the harness override, defaulting to /output."""
+        return cls(os.environ.get(OUTPUT_ENV_VAR, DEFAULT_OUTPUT_DIR))
+
+    @property
+    def path(self) -> Path:
+        """The full output path, creating its directory on demand."""
+        directory = Path(self.directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / self.filename
+
+    def write(self, entry: str) -> Path:
+        """Write the entry plus one trailing newline, as UTF-8 text."""
+        target = self.path
+        target.write_text(entry + "\n", encoding="utf-8", newline="\n")
+        return target
+
+    def verify(self, entry: str, target: Path) -> None:
+        """Read the file back and prove it is exactly what we intended."""
+        written = target.read_text(encoding="utf-8")
+        if written != entry + "\n":
+            raise EntryError("verify: written entry does not match ENTRY")
+        validate(written.rstrip("\n"))
 
 
-def write_entry(entry: str, output_path: str) -> None:
-    """Write the entry plus one trailing newline, as UTF-8 text."""
-    with open(output_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(entry + "\n")
-
-
-def verify_written(entry: str, output_path: str) -> None:
-    """Read the file back and prove it is exactly what we intended."""
-    with open(output_path, "r", encoding="utf-8") as f:
-        written = f.read()
-    if written != entry + "\n":
-        raise ValueError("written entry does not match ENTRY")
-    validate_entry(written.rstrip("\n"))
-
-
-def summarize(entry: str, output_path: str) -> str:
+def report(entry: str, target: Path) -> str:
     """Build the one-line success report for the entry."""
     words = len(entry.split())
-    return f"wrote {len(entry)} chars ({words} words) to {output_path}"
+    return f"wrote {len(entry)} chars ({words} words) to {target}"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Validate, write, verify, and report. Returns a process exit code."""
-    validate_entry(ENTRY)
-    output_path = resolve_output_path()
-    write_entry(ENTRY, output_path)
-    verify_written(ENTRY, output_path)
-    print(summarize(ENTRY, output_path))
+    del argv  # no command-line options: the entry is fixed
+    sink = Sink.from_environment()
+    try:
+        validate(ENTRY)
+        target = sink.write(ENTRY)
+        sink.verify(ENTRY, target)
+    except EntryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(report(ENTRY, target))
     return 0
 
 
